@@ -53,6 +53,12 @@ def pytest_addoption(parser):
         help="Delete files that was create by tests without running tests. (default: %(default)s)",
     )
 
+    group._addoption(
+        "--dumpdb",
+        action="store_true",
+        help="Update data.json without running tests. (default: %(default)s)",
+    )
+
 
 def _run(command, capture_output=True):
     try:
@@ -89,6 +95,25 @@ def restore_db():
         "psql -U root -d postgres -v from=test_db -v to=cvat -f /tmp/restore.sql"
     )
 
+def running_containers():
+    return [cn for cn in _run("docker ps --format {{.Names}}")[0].split("\n") if cn]
+
+
+def dump_db():
+    if 'test_cvat_1' not in running_containers():
+        pytest.exit("CVAT is not running")
+    with open(osp.join(CVAT_DB_DIR, "data.json"), "w") as f:
+        try:
+            run(
+                "docker exec test_cvat_1 \
+                    python manage.py dumpdata \
+                    --indent 2 --natural-foreign \
+                    --exclude=auth.permission --exclude=contenttypes".split(),
+                stdout=f, check=True
+            )
+        except CalledProcessError:
+            pytest.exit("Database dump failed.\n")
+
 
 def create_compose_files():
     for filename in CONTAINER_NAME_FILES:
@@ -111,7 +136,7 @@ def delete_compose_files():
 
 
 def wait_for_server():
-    for _ in range(60):
+    for _ in range(30):
         response = requests.get(get_api_url("users/self"))
         if response.status_code == HTTPStatus.UNAUTHORIZED:
             break
@@ -127,14 +152,10 @@ def restore_data_volumes():
 
 
 def start_services(rebuild=False):
-    running_containers = [
-        cn for cn in _run("docker ps --format {{.Names}}")[0].split("\n") if cn
-    ]
-
-    if any([cn in ["cvat", "cvat_db"] for cn in running_containers]):
+    if any([cn in ["cvat", "cvat_db"] for cn in running_containers()]):
         pytest.exit(
             "It's looks like you already have running cvat containers. Stop them and try again. "
-            f"List of running containers: {', '.join(running_containers)}"
+            f"List of running containers: {', '.join(running_containers())}"
         )
 
     _run(
@@ -156,9 +177,14 @@ def services(request):
     start = request.config.getoption("--start-services")
     rebuild = request.config.getoption("--rebuild")
     cleanup = request.config.getoption("--cleanup")
+    dumpdb = request.config.getoption("--dumpdb")
 
     if start and stop:
         raise Exception("--start-services and --stop-services are incompatible")
+
+    if dumpdb:
+        dump_db()
+        pytest.exit("data.json has been updated", returncode=0)
 
     if cleanup:
         delete_compose_files()
@@ -168,7 +194,10 @@ def services(request):
         create_compose_files()
 
     if stop:
-        _run(f"docker-compose -p {PREFIX} -f {' -f '.join(DC_FILES)} down -v", capture_output=False)
+        _run(
+            f"docker-compose -p {PREFIX} -f {' -f '.join(DC_FILES)} down -v",
+            capture_output=False,
+        )
         pytest.exit("All testing containers are stopped", returncode=0)
 
     start_services(rebuild)
